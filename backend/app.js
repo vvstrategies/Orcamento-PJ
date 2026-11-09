@@ -1,0 +1,150 @@
+import {seedPJInstallation} from './pj-installation.js';
+import express from 'express';
+import {IntegrationService} from './integration-service.js';
+import {GoogleAdsProvider,MetaAdsProvider} from './ad-spend-providers.js';
+import {registerIntegrations} from './integration-routes.js';
+import {AsaasService} from './asaas-service.js';
+import {registerAsaas} from './asaas-routes.js';
+import {ProfitService} from './profit-service.js';
+import {registerProfit} from './profit-routes.js';
+import {CommercialService,registerCommercial} from './commercial.js';
+import {AvatarService,registerAvatars} from './avatars.js';
+import {DreService} from './dre-service.js';
+import {registerDre} from './dre-routes.js';
+import {financialDemo} from './finance-demo.js';
+import {FinanceService} from './finance-service.js';
+import {HeiGITOpenRouteServiceProvider,HeiGITPeliasGeocoder} from './routes-provider.js';
+import {CepLookupService} from './cep-cache.js';
+import {BrasilApiCepProvider,ViaCepProvider} from './cep-provider.js';
+import path from 'node:path';
+import fs from 'node:fs';
+import crypto from 'node:crypto';
+import {fileURLToPath} from 'node:url';
+import {Repository,cleanQuote,documentHash,fail,hash,proposalFilename} from './database.js';
+import {security,vault} from './security.js';
+import {GoogleIntegration} from './google.js';
+import {Service} from './service.js';
+import {modelo} from '../utils/proposta.js';
+import {gerarPDFPJ} from '../utils/pjPdf.js';
+import {migrateServiceCatalog} from './service-catalog.js';
+import {initializeInstallation,completed,finishSetup,validateSettings} from './onboarding.js';
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
+const publicPDF=({storageKey,...pdf})=>pdf;
+const wrap=fn=>(req,res,next)=>Promise.resolve().then(()=>fn(req,res)).catch(next);
+export function createApp(options={}){
+  const origin=options.origin||'http://localhost:3000',production=options.production||false;
+  if(production&&new URL(origin).protocol!=='https:')throw Error('APP_ORIGIN deve usar HTTPS em produção.');
+  const repo=options.repo||new Repository(options.dataDir||path.join(root,'data'));
+  seedPJInstallation(repo);
+  initializeInstallation(repo);
+  migrateServiceCatalog(repo);
+  const tokenVault=vault(repo.dir,options.encryptionKey,production);
+  const google=options.google||new GoogleIntegration(repo,tokenVault,options.googleConfig,options.fetcher);
+  const service=new Service(repo,google),sec=security(repo,{origin,production}),app=express();
+  const cepLookup=options.cepLookup||new CepLookupService(repo,{primary:new BrasilApiCepProvider({fetcher:options.fetcher||globalThis.fetch}),fallback:new ViaCepProvider({fetcher:options.fetcher||globalThis.fetch})});
+  const geocoder=options.geocoder||new HeiGITPeliasGeocoder(options.routesConfig);
+  const finance=new FinanceService(repo,service,options.routeProvider||new HeiGITOpenRouteServiceProvider(options.routesConfig),{dailyLimit:options.routesConfig?.dailyLimit,directionsDailyLimit:options.routesConfig?.directionsDailyLimit,geocodingDailyLimit:options.routesConfig?.geocodingDailyLimit,routeCacheHours:options.routesConfig?.cacheHours,geocoder:options.routeProvider&&options.geocoder===undefined?null:geocoder});
+  const dre=new DreService(repo,finance),profit=new ProfitService(repo,finance,dre,service);service.onComplete=(id,day)=>{const value=dre.recognize(id,day);profit.captureContext(id);return value;};
+  const asaas=new AsaasService(repo,options.asaasConfig,options.asaasFetcher||options.fetcher||globalThis.fetch);
+  const ads=options.adProviders||{'google-ads':new GoogleAdsProvider(options.integrationConfig?.googleAds,options.integrationFetcher),'meta-ads':new MetaAdsProvider(options.integrationConfig?.metaAds,options.integrationFetcher)};
+  const integrations=new IntegrationService(repo,tokenVault,ads,finance,dre,google);
+  const commercial=new CommercialService(repo,{dre,finance});
+  app.disable('x-powered-by');if(production)app.set('trust proxy',1);app.use(sec.headers);
+  // Corpo grande (fotos e logos em base64) só nas rotas autenticadas que precisam; login, setup e webhooks ficam no limite pequeno.
+  const largeBodies=[['PUT',/^\/api\/proposals\/[^/]+$/],['PUT',/^\/api\/draft$/],['PUT',/^\/api\/settings$/],['POST',/^\/api\/onboarding$/],['POST',/^\/api\/import$/],['POST',/^\/api\/preview-pdf$/]];
+  const smallJson=express.json({limit:'256kb'}),largeJson=express.json({limit:'100mb'});
+  app.use((req,res,next)=>largeBodies.some(([method,pattern])=>req.method===method&&pattern.test(req.path))?next():smallJson(req,res,next));
+  // A Asaas chama esta rota sem sessão do navegador. O token próprio do webhook é validado no serviço.
+  app.post('/api/webhooks/asaas',wrap(async(req,res)=>{await asaas.webhook(req.headers['asaas-access-token'],req.body);res.status(204).end();}));
+  app.get('/api/health',(req,res)=>res.json({status:'ok',product:'pj'}));
+  app.get('/api/session',(req,res)=>res.json({...sec.status(req),needsCompanySetup:!!req.session&&!completed(repo)}));
+  app.post('/api/setup',sec.sameOrigin,wrap(sec.setup));app.post('/api/login',sec.sameOrigin,wrap(sec.login));
+  app.use('/api',sec.requireAuth,sec.csrf,largeJson);app.post('/api/logout',sec.logout);
+  const settings=()=>repo.config('settings')||{company:modelo.company(),terms:modelo.terms()},companySource=()=>completed(repo)?settings():repo.config('companySetupDraft');
+  // ?lite=1 tira o logo (data URL) da resposta e aponta para /api/settings/logo.
+  const lite=(req,value)=>{if(req.query.lite!=='1'||!value?.company)return value;const {logo,...company}=value.company;return {...value,company,logoUrl:logo?'/api/settings/logo':null}};
+  // Quem usa a versão leve não recebe o logo: company.logo ausente mantém o atual; '' remove.
+  const keepLogo=(body,current)=>body?.company&&typeof body.company==='object'&&body.company.logo===undefined?{...body,company:{...body.company,logo:current?.company?.logo||''}}:body;
+  app.get('/api/settings/logo',(req,res)=>{const m=/^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/]+={0,2})$/.exec(companySource()?.company?.logo||'');if(!m)throw fail(404,'Logotipo não cadastrado.');const etag='"'+hash(m[2]).slice(0,32)+'"';res.set({'Cache-Control':'private, max-age=300',ETag:etag});if(req.headers['if-none-match']===etag)return res.status(304).end();res.type(m[1]).send(Buffer.from(m[2],'base64'))});
+  app.get('/api/onboarding',(req,res)=>res.json({required:!completed(repo),settings:lite(req,companySource()),reviewExisting:!!repo.config('universal-before-onboarding')?.settings}));
+  app.post('/api/onboarding',wrap(async(req,res)=>{const value=await finishSetup(repo,keepLogo(req.body,repo.config('companySetupDraft')));await finance.rememberCompanyAddress(value.company?.location||'').catch(()=>null);res.json(value)}));
+  app.use('/api',(req,res,next)=>completed(repo)?next():res.status(428).json({code:'COMPANY_SETUP_REQUIRED',error:'Configure a empresa para continuar.'}));
+  registerAsaas(app,asaas,wrap);
+  registerDre(app,dre,wrap);
+  registerIntegrations(app,integrations,wrap);
+  registerProfit(app,profit,wrap);
+  registerCommercial(app,commercial,wrap);registerAvatars(app,new AvatarService(repo,commercial),wrap);
+  app.get('/api/financial-demo',(req,res)=>res.json(financialDemo()));
+  app.get('/api/financial-settings',(req,res)=>res.json({settings:finance.settings(),companyLocation:finance.company().location||'',services:repo.config('settings')?.services||[],routes:finance.routeCache.status()}));
+  app.put('/api/financial-settings',(req,res)=>res.json(finance.saveSettings(req.body)));
+  app.get('/api/proposals/:id/finance',(req,res)=>res.json(finance.view(req.params.id)));
+  app.put('/api/proposals/:id/finance',wrap(async(req,res)=>res.json(await finance.calculate(req.params.id,req.body))));
+  app.post('/api/proposals/:id/finance/refresh',wrap(async(req,res)=>res.json(await finance.refreshAutomatically(req.params.id))));
+  app.post('/api/proposals/:id/finance/route',wrap(async(req,res)=>res.json(await finance.route(req.params.id,req.body))));
+  app.get('/api/financial-export',(req,res)=>{res.set('Cache-Control','no-store');res.json({...profit.export(),integrations:integrations.export()});});
+  app.get('/api/settings',(req,res)=>res.json(lite(req,settings())));
+  app.get('/api/cep/:postalCode',wrap(async(req,res)=>res.json(await cepLookup.lookup(req.params.postalCode))));
+  app.put('/api/settings',wrap(async(req,res)=>{const value=await validateSettings({...settings(),...keepLogo(req.body,settings())});repo.transaction(()=>{const old=settings(),draft=repo.config('draft');if(draft?.quote){if(JSON.stringify(draft.quote.company)===JSON.stringify(old.company))draft.quote.company=value.company;if(JSON.stringify(draft.quote.terms)===JSON.stringify(old.terms))draft.quote.terms=value.terms;repo.setConfig('draft',draft)}repo.setConfig('settings',value)});await finance.rememberCompanyAddress(value.company?.location||'').catch(()=>null);res.json(value)}));
+  app.get('/api/draft',(req,res)=>res.json(repo.config('draft')));
+  app.put('/api/draft',(req,res)=>{const quote=cleanQuote(req.body.quote);quote.revision=req.body.quote.revision;repo.setConfig('draft',{id:'current',quote});res.json({id:'current',quote})});
+  // ?summary=1: mesmo formato, sem imagens. Em cada item, photos vira photoCount (número); company.logo é omitido.
+  app.get('/api/proposals',(req,res)=>res.json(repo.list({summary:req.query.summary==='1'})));
+  app.get('/api/proposals/:id',(req,res)=>res.json(repo.requireProposal(req.params.id)));
+  app.get('/api/proposals/:id/versions',(req,res)=>res.json(repo.listVersions(req.params.id)));
+  app.put('/api/proposals/:id',wrap(async(req,res)=>{if(req.params.id!==req.body.id)throw fail(400,'Identificador divergente.');if(service.locks.has(req.params.id))throw fail(409,'Aguarde o agendamento terminar antes de editar.');const current=repo.proposal(req.params.id);commercial.checkTags(req.body.tags,current?.tags);const changed=!!current&&documentHash(current)!==documentHash(cleanQuote(req.body));if(changed&&Number(req.body.revision)===current.revision)await asaas.cancelActiveForRevision(current.id,current.revision);const saved=repo.saveProposal(req.body);commercial.safeSync(saved);await finance.refreshAutomatically(saved.id).catch(()=>null);const latest=repo.listPDFs(saved.id)[0];if(repo.operation(saved.id).status==='generated'&&(latest?.proposalVersionId!==saved.versionId||latest?.fingerprint!==documentHash(saved)))await service.pdf(saved).catch(()=>null);res.json(saved)}));
+  app.post('/api/proposals/bulk',(req,res)=>res.json(commercial.bulkUpdate(req.body,id=>service.locks.has(id))));
+  app.delete('/api/proposals/:id',wrap(async(req,res)=>{if(service.locks.has(req.params.id))throw fail(409,'Aguarde a operação em andamento antes de excluir.');res.json(await service.purge(req.params.id));}));
+  app.delete('/api/proposals/:id/versions/:versionId',wrap(async(req,res)=>{if(service.locks.has(req.params.id))throw fail(409,'Aguarde a operação em andamento antes de excluir a versão.');res.json(repo.deleteVersion(req.params.id,req.params.versionId));}));
+  app.get('/api/operations',(req,res)=>res.json(repo.list().map(q=>{const job=repo.job(q.id);return {...repo.operation(q.id),pendingAction:job?{kind:job.kind,values:job.values,error:job.error}:null}})));
+  // ?summary=1: o snapshot de cada PDF vem sem imagens, no mesmo formato de /api/proposals?summary=1.
+  app.get('/api/documents',(req,res)=>res.json(repo.listPDFs(req.query.proposalId,{summary:req.query.summary==='1'}).map(publicPDF)));
+  app.get('/api/pdfs/:id',(req,res)=>{const pdf=repo.pdf(req.params.id);if(!pdf)throw fail(404,'PDF não encontrado.');res.type('pdf');res.set('Content-Disposition',`inline; filename="${pdf.filename.replace(/["\r\n]/g,'_')}"`);res.sendFile(repo.file(pdf))});
+  app.post('/api/proposals/:id/pdf',wrap(async(req,res)=>res.json(publicPDF(await service.generate(req.params.id,req.body)))));
+  app.post('/api/proposals/:id/document/refresh',wrap(async(req,res)=>{const id=req.params.id;if(service.locks.has(id))throw fail(409,'Aguarde a operação em andamento antes de atualizar o documento.');const quote=repo.requireProposal(id);if(repo.operation(id).status!=='generated')throw fail(409,'O documento é preservado após o agendamento.');const latest=repo.listPDFs(id)[0],pdf=latest?.fingerprint===documentHash(quote)?latest:await service.pdf(quote);res.json(publicPDF(pdf));}));
+  app.post('/api/preview-pdf',wrap(async(req,res)=>{const q=cleanQuote(req.body,true),file=await gerarPDFPJ(q,{outputDir:repo.files,format:req.query.format==='mobile'?'mobile':'a4'});try{res.type('pdf').send(fs.readFileSync(file))}finally{fs.unlinkSync(file)}}));
+  app.post('/api/proposals/:id/schedule',wrap(async(req,res)=>res.json(await service.schedule(req.params.id,req.body))));
+  app.post('/api/proposals/:id/schedule/cancel',wrap(async(req,res)=>res.json(await service.cancelSchedule(req.params.id,req.body))));
+  app.post('/api/proposals/:id/status',wrap(async(req,res)=>res.json(await service.status(req.params.id,req.body.status,req.body))));
+  app.get('/api/google/status',(req,res)=>res.json(google.status()));
+  app.post('/api/google/connect',(req,res)=>res.json(google.connect(req.session)));
+  app.get('/api/google/callback',wrap(async(req,res)=>{try{await google.callback(req.query,req.session);res.redirect('/?google=connected#configuracoes')}catch(error){res.redirect('/?google=error&reason='+encodeURIComponent(error.status?error.message:'Não foi possível conectar. Tente novamente.')+'#configuracoes')}}));
+  app.post('/api/google/disconnect',wrap(async(req,res)=>{if(service.locks.size)throw fail(409,'Aguarde as operações em andamento antes de desconectar.');res.json(await google.disconnect())}));
+  app.get('/api/backup',(req,res)=>res.json({version:4,settings:settings(),proposals:repo.list(),draft:repo.config('draft'),operations:repo.listOperations(),documents:repo.listPDFs().map(p=>({...publicPDF(p),data:'data:application/pdf;base64,'+fs.readFileSync(repo.file(p)).toString('base64')}))}));
+  app.post('/api/import',wrap(async(req,res)=>{
+    const data=req.body;if(![1,2,3,4].includes(data.version)||!Array.isArray(data.proposals)||data.proposals.length>500||!data.proposals.length||!Array.isArray(data.operations||[])||!Array.isArray(data.documents||[]))throw fail(400,'Backup inválido.');
+    const idMap=new Map(),staged=[],proposals=[],ops=[],migration=req.query.migration==='yes';
+    try{
+      for(const raw of data.proposals){if(idMap.has(raw.id))throw fail(400,'Identificador repetido no backup.');const source=hash(JSON.stringify({id:raw.id,content:documentHash(cleanQuote(raw))}));const existing=migration&&repo.db.prepare('SELECT proposal_id FROM migrations WHERE source_id=?').get(source);if(existing){idMap.set(raw.id,null);continue}const q=cleanQuote({...raw,id:crypto.randomUUID()});idMap.set(raw.id,q.id);proposals.push({q,source})}
+      for(const raw of data.operations||[]){if(!idMap.has(raw.id))throw fail(400,'Status sem proposta no backup.');const id=idMap.get(raw.id);if(!id)continue;ops.push({id,status:['completed','cancelled'].includes(raw.status)?raw.status:'generated',schedule:null,suggestedSchedule:raw.schedule||raw.suggestedSchedule||null})}
+      const versions=new Set();
+      for(const p of data.documents||[]){if(!idMap.has(p.proposalId))throw fail(400,'PDF sem proposta no backup.');const id=idMap.get(p.proposalId);if(!id)continue;const unique=id+':'+p.version;if(!Number.isInteger(p.version)||p.version<1||versions.has(unique)||!/^data:application\/pdf;base64,[A-Za-z0-9+/]+={0,2}$/.test(p.data||''))throw fail(400,'PDF inválido no backup.');versions.add(unique);const bytes=Buffer.from(p.data.split(',')[1],'base64');if(bytes.subarray(0,5).toString()!=='%PDF-')throw fail(400,'Conteúdo do PDF inválido.');const snapshot=cleanQuote({...p.snapshot,id});staged.push({id:crypto.randomUUID(),proposalId:id,version:p.version,snapshot,storage:crypto.randomUUID()+'.pdf',bytes,generatedAt:Number.isFinite(Date.parse(p.generatedAt))?p.generatedAt:new Date().toISOString()})}
+      for(const p of staged)fs.writeFileSync(path.join(repo.files,p.storage),p.bytes,{flag:'wx'});
+      repo.transaction(()=>{const now=new Date().toISOString(),versionIds=new Map();for(const {q,source} of proposals){q.versionId=crypto.randomUUID();versionIds.set(q.id,q.versionId);repo.db.prepare('INSERT INTO proposals (id,snapshot,revision,created_at,updated_at,archived_at) VALUES (?,?,?,?,?,NULL)').run(q.id,JSON.stringify(q),1,now,q.updatedAt||now);repo.db.prepare('INSERT INTO proposal_versions (id,proposal_id,sequence,snapshot,financial_snapshot,created_at,deleted_at,deleted_by) VALUES (?,?,?,?,?,?,NULL,NULL)').run(q.versionId,q.id,1,JSON.stringify(q),null,now);if(migration)repo.db.prepare('INSERT OR IGNORE INTO migrations VALUES (?,?)').run(source,q.id)}for(const o of ops)repo.setOperation(o);for(const p of staged){const versionId=versionIds.get(p.proposalId)||null;p.snapshot.versionId=versionId;repo.db.prepare('INSERT INTO pdfs (id,proposal_id,version,filename,storage_key,snapshot,fingerprint,generated_at,proposal_version_id) VALUES (?,?,?,?,?,?,?,?,?)').run(p.id,p.proposalId,p.version,proposalFilename(p.snapshot),p.storage,JSON.stringify(p.snapshot),documentHash(p.snapshot),p.generatedAt,versionId);}});
+      for(const {q} of proposals)commercial.safeSync(repo.proposal(q.id));res.json({imported:proposals.length,proposals:proposals.map(({q})=>repo.proposal(q.id))});
+    }catch(error){for(const p of staged){const file=path.join(repo.files,p.storage);if(fs.existsSync(file))fs.unlinkSync(file)}throw error}
+  }));
+  app.use('/api',(req,res)=>res.status(404).json({error:'Recurso não encontrado.'}));
+  const allowed=new Set(fs.readdirSync(path.join(root,'public')).filter(n=>/\.(html|css|js)$/.test(n)));
+  // Na Hostinger, public/ é servido direto pelo CDN, sem Cache-Control e ignorando query string; a versão no caminho passa pelo app e muda a cada deploy.
+  const assetHash=crypto.createHash('sha256');for(const n of [...allowed].sort())assetHash.update(fs.readFileSync(path.join(root,'public',n)));const assetVersion=assetHash.digest('hex').slice(0,10);
+  const indexHtml=fs.readFileSync(path.join(root,'public/index.html'),'utf8').replace(/(src|href)="([a-zA-Z0-9_.-]+\.(?:js|css))"/g,`$1="v/${assetVersion}/$2"`);
+  app.get('/',(req,res)=>res.set('Cache-Control','no-cache').type('html').send(indexHtml));
+  app.get('/guia-integracoes',sec.requireAuth,(req,res)=>res.type('text/plain; charset=utf-8').sendFile(path.join(root,'INTEGRATIONS_SETUP.md')));
+  app.get('/guia-google',sec.requireAuth,(req,res)=>res.type('text/plain').sendFile(path.join(root,'docs/CONEXAO-GOOGLE.md')));
+  // Só a versão atual existe: o conteúdo de /v/<hash>/ nunca muda e pode ficar em cache por um ano.
+  app.use((req,res,next)=>{const m=/^\/v\/([a-f0-9]{10})(\/.+)$/.exec(req.path);if(!m)return next();if(m[1]!==assetVersion)return res.status(404).json({error:'Recurso não encontrado.'});req.url=m[2];req.versioned=true;next()});
+  app.use((req,res,next)=>{let name;try{name=decodeURIComponent(req.path).slice(1)}catch{return next()}
+    if(allowed.has(name)||/^(assets|vendor)\/[a-zA-Z0-9_.-]+$/.test(name))return res.sendFile(path.join(root,'public',name),{headers:{'Cache-Control':req.versioned?'public, max-age=31536000, immutable':'no-cache'}});next()});
+  app.use((req,res)=>res.status(404).json({error:'Recurso não encontrado.'}));
+  const bodyErrors={'entity.too.large':'O conteúdo enviado é grande demais.','entity.parse.failed':'Conteúdo enviado inválido.'};
+  app.use((error,req,res,next)=>{
+    if(res.headersSent)return next(error);
+    if(!error.status){console.error(`Erro em ${req.method} ${req.path}:`,error.stack||error);return res.status(500).json({error:'Erro interno. Tente novamente em instantes.'})}
+    res.status(error.status).json({error:bodyErrors[error.type]||error.message});
+  });
+  // Tarefas de manutenção: chamadas pelo servidor depois de começar a atender, sem atrasar createApp.
+  const sweep=()=>{try{sec.sweep()}catch(error){console.error('Falha ao limpar sessões expiradas:',error)}};
+  const start=()=>{sweep();setInterval(sweep,6*3600000).unref();setImmediate(()=>commercial.syncAll())};
+  return {app,repo,google,service,finance,dre,profit,integrations,asaas,commercial,start};
+}
+
