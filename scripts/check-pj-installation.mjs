@@ -13,6 +13,9 @@ try{
  seedPJInstallation(repo);initializeInstallation(repo);
  const settings=repo.config('settings'),financial=repo.config('financial-settings-v1');
  assert.equal(settings.company.name,'PJ Higienização');
+ assert.equal(settings.company.phone,'(11) 99402-4408');
+ assert.equal(settings.company.email,'pjhigienizacaosp@gmail.com');
+ assert.equal(settings.company.website,'');
  assert.equal(settings.company.proposalPrefix,'PJ');
  assert.equal(settings.company.location,'Rua Manaus, 139, Rochdalle, Osasco - SP, 06226-030, Brasil');
  assert.match(settings.company.logo,/^data:image\/jpeg;base64,/);

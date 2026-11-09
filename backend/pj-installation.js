@@ -18,8 +18,8 @@ export function seedPJInstallation(repo){
   if(!fs.existsSync(logoPath))throw Error('O logotipo inicial da PJ não foi encontrado.');
   const company=modelo.normalizeCompany({
     name:'PJ Higienização',
-    phone:'',
-    email:'',
+    phone:'(11) 99402-4408',
+    email:'pjhigienizacaosp@gmail.com',
     location:'Rua Manaus, 139, Rochdalle, Osasco - SP, 06226-030, Brasil',
     website:'',
     tagline:'Limpeza e Impermeabilização de Estofados',

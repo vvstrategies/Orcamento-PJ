@@ -12,12 +12,15 @@ npm ci
 npm run local
 ```
 
-Abra http://localhost:3311. Crie uma senha própria (12 a 200 caracteres), revise os dados da empresa e complete o telefone ou e-mail comercial. O projeto não distribui senha, conta conectada, orçamento ou cliente de outra empresa.
+Abra http://localhost:3311. Crie uma senha própria (12 a 200 caracteres) e revise os dados da empresa. O projeto não distribui senha, conta conectada, orçamento ou cliente de outra empresa.
 
 ## Configuração inicial
 
 - Nome: PJ Higienização.
 - Especialidade: Limpeza e Impermeabilização de Estofados.
+- WhatsApp: (11) 99402-4408.
+- E-mail: pjhigienizacaosp@gmail.com.
+- Domínio: ainda não definido; uso local por enquanto.
 - Origem: Rua Manaus, 139, Rochdalle, Osasco - SP, 06226-030, Brasil.
 - Logo original fornecida, azul-marinho `#161c49` e turquesa `#32b9b5`.
 - Prefixo das propostas: `PJ`.
