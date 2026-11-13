@@ -45,3 +45,7 @@ npm run test:pj
 ```
 
 A rota confere município, UF e CEP (quando informado pelo provedor) antes de aceitar coordenadas. Resultados de outro estado/cidade são rejeitados. A localização pode ter precisão de rua, sem identificar o número; as distâncias são estimativas e podem ser corrigidas manualmente.
+
+## Atualização da matriz — 13/11/2026
+
+Interface e recursos sincronizados com Herboclean `72ab6d9` (12/11/2026), preservando a marca, os cadastros e as integrações próprias desta empresa. Veja [o relatório de atualização](docs/ATUALIZACAO-MATRIZ-20261113.md).
