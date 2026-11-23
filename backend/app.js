@@ -42,7 +42,7 @@ export function createApp(options={}){
   initializeInstallation(repo);
   migrateServiceCatalog(repo);
   const tokenVault=vault(repo.dir,options.encryptionKey,production);
-  const google=options.google||new GoogleIntegration(repo,tokenVault,options.googleConfig,options.fetcher);
+  const google=options.google||new GoogleIntegration(repo,tokenVault,{...options.googleConfig,appOrigin:origin,oauthDiagnostics:options.oauthDiagnostics===true},options.fetcher);
   const service=new Service(repo,google),sec=security(repo,{origin,production,legacyHosts:options.legacyHosts||[]}),app=express();
   const cepLookup=options.cepLookup||new CepLookupService(repo,{primary:new BrasilApiCepProvider({fetcher:options.fetcher||globalThis.fetch}),fallback:new ViaCepProvider({fetcher:options.fetcher||globalThis.fetch})});
   // Reserva do OpenStreetMap só quando ligada (produção); testes e pré-visualização nunca saem para a rede.
@@ -76,7 +76,7 @@ export function createApp(options={}){
   app.use('/api',(req,res,next)=>completed(repo)?next():res.status(428).json({code:'COMPANY_SETUP_REQUIRED',error:'Configure a empresa para continuar.'}));
   registerAsaas(app,asaas,wrap);
   dre.receipts=new ReceiptStore(repo);registerReceipts(app,{store:dre.receipts,dre},wrap);registerDre(app,dre,wrap);
-  registerIntegrations(app,integrations,wrap);
+  registerIntegrations(app,integrations,wrap,origin);
   registerProfit(app,profit,wrap);
   registerCommercial(app,commercial,wrap);registerAvatars(app,new AvatarService(repo,commercial),wrap);
   app.get('/api/financial-demo',(req,res)=>res.json(financialDemo()));
@@ -115,7 +115,7 @@ export function createApp(options={}){
   app.get('/api/google/status',(req,res)=>res.json(google.status()));
   app.post('/api/google/connect',(req,res)=>res.json(google.connect(req.session,{purpose:req.body?.purpose})));
   app.get('/api/google/contacts',wrap(async(req,res)=>{res.set('Cache-Control','no-store');res.json(await google.contacts({pageToken:req.query.pageToken,query:req.query.q}))}));
-  app.get('/api/google/callback',wrap(async(req,res)=>{try{const r=await google.callback(req.query,req.session);res.redirect(r.purpose==='contacts'?'/?google=contacts#criar':'/?google=connected#configuracoes')}catch(error){res.redirect('/?google=error&reason='+encodeURIComponent(error.status?error.message:'Não foi possível conectar. Tente novamente.')+(error.purpose==='contacts'?'#criar':'#configuracoes'))}}));
+  app.get('/api/google/callback',wrap(async(req,res)=>{try{await google.callback(req.query,req.session,new URL(req.path,origin).href);res.redirect('/?google=connected&settings=integrations#configuracoes')}catch(error){res.redirect('/?google=error&settings=integrations&reason='+encodeURIComponent(error.status?error.message:'Não foi possível conectar. Inicie uma nova autorização.')+'#configuracoes')}}));
   app.post('/api/google/disconnect',wrap(async(req,res)=>{if(service.locks.size)throw fail(409,'Aguarde as operações em andamento antes de desconectar.');res.json(await google.disconnect())}));
   app.get('/api/backup',(req,res)=>res.json({version:4,settings:settings(),proposals:repo.list(),draft:repo.config('draft'),operations:repo.listOperations(),documents:repo.listPDFs().map(p=>({...publicPDF(p),data:'data:application/pdf;base64,'+fs.readFileSync(repo.file(p)).toString('base64')}))}));
   app.post('/api/import',wrap(async(req,res)=>{

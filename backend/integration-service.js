@@ -1,11 +1,13 @@
 import crypto from 'node:crypto';
-import {fail,hash} from './database.js';
+import {fail} from './database.js';
+import {OAuthStateStore} from './oauth-state-store.js';
 import {text,sum,months,localDate} from './dre-domain.js';
 import {migrateIntegrations} from './integration-migration.js';
 import {providers,providerId,integrationError,errorCode,message,account,metric,dayRange,shiftDay,accountDay,monthlyBounds,marketingSummary,TRANSIENT_CODES,ROUTE_INPUT_CODES} from './integration-domain.js';
 const now=()=>new Date().toISOString(),read=r=>r?JSON.parse(r.data):null;
 export class IntegrationService {
  constructor(repo,vault,adProviders,finance,dre,google){Object.assign(this,{repo,vault,providers:adProviders,finance,dre,google});this.owner=crypto.randomUUID();this.busy=new Set();migrateIntegrations(repo);
+ this.oauth=google.oauth||new OAuthStateStore(repo,vault);
  finance.routeCache.onResult=r=>this.mapResult(r);
  dre.externalExpenses=(from,to)=>this.dreExpenses(from,to);
  dre.externalWarnings=e=>this.duplicateWarning(e);
@@ -18,10 +20,10 @@ export class IntegrationService {
  secret(id){const r=this.record(id);return r?.secret?this.vault.open(r.secret):null;}
  persist(id,data,tokens=undefined){const old=this.record(id);this.repo.db.prepare('INSERT INTO integration_connections VALUES (?,?,?) ON CONFLICT(provider) DO UPDATE SET secret=excluded.secret,data=excluded.data').run(id,tokens===undefined?old?.secret??null:tokens===null?null:this.vault.seal(tokens),JSON.stringify(data));}
  status(id){const provider=this.provider(id),s=this.state(id),authorized=!!this.record(id)?.secret;
- const pending=this.repo.db.prepare('SELECT expires FROM integration_oauth_states WHERE provider=? AND expires>? ORDER BY expires DESC LIMIT 1').get(id,Date.now());
+ const pending=this.oauth.pending(id);
  const code=s.lastErrorCode;
  // Falha temporária (timeout, 429, 5xx) nunca vira "desconectada": os tokens continuam guardados.
- let status=!provider.configured?'not_configured':pending?'connecting':!authorized?'not_connected':code==='RECONNECT'?'revoked':code==='CONFIG'?'config_error':TRANSIENT_CODES.includes(code)?'temporarily_unavailable':s.status==='error'||s.status==='attention'?'attention':!s.account?'attention':'connected';
+ let status=!provider.configured?'not_configured':pending&&!authorized?'connecting':!authorized?'not_connected':code==='RECONNECT'?'revoked':code==='CONFIG'?'config_error':TRANSIENT_CODES.includes(code)?'temporarily_unavailable':s.status==='error'||s.status==='attention'?'attention':!s.account?'attention':'connected';
  return {provider:id,status,configured:provider.configured,authorized,connectedAt:s.connectedAt,lastTestAt:s.lastTestAt||null,lastSyncAt:s.lastSyncAt,lastSuccessfulSyncAt:s.lastSuccessfulSyncAt,lastErrorAt:s.lastErrorAt,lastErrorCode:s.lastErrorCode,tokenRefreshAt:s.tokenRefreshAt||null,accountName:s.account?.name||null,externalAccountId:s.account?.id||null,metadata:{currency:s.account?.currency||null,timezone:s.account?.timezone||null,managerId:s.account?.managerId||null,needsAccount:authorized&&!s.account,needsReconnect:s.lastErrorCode==='RECONNECT',connectionId:s.connectionId||null,version:provider.version,connectingUntil:pending?new Date(pending.expires).toISOString():null},message:!provider.configured?message('NOT_CONFIGURED'):s.lastErrorCode?message(s.lastErrorCode):!authorized?message('NOT_CONNECTED'):!s.account?message('SELECT_ACCOUNT'):s.account.currency!=='BRL'?message('CURRENCY'):null};}
  googleRows(){
  const g=this.google.status(),c=this.google.connection?.(),map={not_configured:'not_configured',not_connected:'not_connected',revoked:'revoked',config_error:'config_error',attention:'attention',temporarily_unavailable:'temporarily_unavailable',connected:'connected'};
@@ -40,13 +42,13 @@ export class IntegrationService {
  const heartbeat=setInterval(()=>{try{this.repo.db.prepare('UPDATE leases SET expires=? WHERE key=? AND owner=?').run(Date.now()+300000,key,this.owner);}catch{}},30000);heartbeat.unref();
  try{for(const row of this.repo.db.prepare("SELECT data FROM integration_sync_runs WHERE provider=? AND status='running'").all(id)){const r=read(row);this.writeRun({...r,status:'error',finishedAt:now(),errorCode:'INTERRUPTED'});}return await fn()}finally{clearInterval(heartbeat);this.busy.delete(id);this.repo.release(key,this.owner);}}
  async connect(id,session){return this.locked(id,async()=>{const p=this.provider(id);if(!p.configured)throw integrationError('NOT_CONFIGURED',503);
- const state=crypto.randomBytes(32).toString('base64url'),verifier=crypto.randomBytes(48).toString('base64url');this.repo.transaction(()=>{this.repo.db.prepare('DELETE FROM integration_oauth_states WHERE provider=? OR expires<?').run(id,Date.now());this.repo.db.prepare('INSERT INTO integration_oauth_states VALUES (?,?,?,?,?)').run(hash(state),id,session.id,verifier,Date.now()+600000);});return {url:p.authorizationURL(state,verifier)};});}
- async callback(id,query,session){return this.locked(id,async()=>{const p=this.provider(id),state=typeof query.state==='string'?query.state:'';
- const saved=this.repo.transaction(()=>{const v=this.repo.db.prepare('SELECT * FROM integration_oauth_states WHERE state=? AND provider=?').get(hash(state),id);if(!v||v.session_id!==session.id||v.expires<Date.now())throw fail(403,'Confirmação expirada ou inválida. Inicie a conexão novamente.');this.repo.db.prepare('DELETE FROM integration_oauth_states WHERE state=?').run(hash(state));return v;});
+ const {state,verifier}=this.oauth.create({integration:id,session,redirectURI:p.config?.redirectURI,clientId:p.config?.clientId});return {url:p.authorizationURL(state,verifier)};});}
+ async callback(id,query,session,callbackURI){return this.locked(id,async()=>{const p=this.provider(id);
+ const saved=this.oauth.claim({state:query.state,session,allowed:[id],redirectURI:p.config?.redirectURI,clientId:p.config?.clientId,callbackURI:p.config?.redirectURI?callbackURI:undefined});
  try{if(query.error)throw integrationError('ACCESS_DENIED',400);if(typeof query.code!=='string'||query.code.length>4000)throw integrationError('ACCESS_DENIED',400);
  const tokens=await p.exchange(query.code,saved.verifier),old=this.state(id),connectionId=crypto.randomUUID();
- this.repo.transaction(()=>{this.persist(id,{...old,provider:id,connectionId,status:'attention',account:null,connectedAt:now(),lastErrorCode:null},tokens);this.repo.db.prepare('DELETE FROM integration_accounts WHERE provider=?').run(id);});return this.status(id);
- }catch(e){this.recordError(id,e);throw e;}});}
+ this.oauth.complete(saved,()=>{this.persist(id,{...old,provider:id,connectionId,status:'attention',account:null,connectedAt:now(),lastErrorCode:null},tokens);this.repo.db.prepare('DELETE FROM integration_accounts WHERE provider=?').run(id);});return this.status(id);
+ }catch(e){this.oauth.fail(saved);this.recordError(id,e);throw e;}});}
  recordError(id,e){const s=this.state(id),code=errorCode(e);this.persist(id,{...s,status:['RECONNECT','CURRENCY','SELECT_ACCOUNT'].includes(code)?'attention':'error',lastErrorAt:now(),lastErrorCode:code});}
  async access(id,force=false){const p=this.provider(id),s=this.state(id),tokens=this.secret(id);if(!p.configured)throw integrationError('NOT_CONFIGURED',503);if(!tokens)throw integrationError('NOT_CONNECTED',409);if(!force&&tokens.expires>Date.now()+60000)return tokens.accessToken;
  // Renovação: o refresh token persistido (criptografado) gera um novo access token sem interação do usuário.
@@ -61,6 +63,7 @@ export class IntegrationService {
  async test(id){return this.locked(id,async()=>{try{const s=this.state(id);if(!s.account)throw integrationError('SELECT_ACCOUNT',409);const a=await this.withToken(id,token=>this.provider(id).testConnection(token,s.account));if(a.id!==s.account.id)throw integrationError('INVALID_DATA');
  this.persist(id,{...this.state(id),account:a,status:a.currency==='BRL'?'connected':'attention',lastErrorCode:a.currency==='BRL'?null:'CURRENCY',lastTestAt:now()});return {ok:true,currencyCompatible:a.currency==='BRL',status:this.status(id)};}catch(e){this.recordError(id,e);throw e;}});}
  async disconnect(id){return this.locked(id,async()=>{const p=this.provider(id),tokens=this.secret(id),old=this.state(id);const revocationSkipped=id==='google-ads'&&!!this.google.connection?.();let revoked=!revocationSkipped;if(tokens&&!revocationSkipped)revoked=await p.disconnect(tokens);
+ this.oauth.cancel([id]);
  this.repo.transaction(()=>{this.persist(id,{...old,status:'attention',account:null,connectionId:null,connectedAt:null,lastErrorCode:revocationSkipped?'REVOCATION_SHARED':revoked?null:'REVOKE_FAILED',lastErrorAt:revoked?old.lastErrorAt:now()},null);this.repo.db.prepare('DELETE FROM integration_accounts WHERE provider=?').run(id);this.repo.db.prepare('DELETE FROM integration_oauth_states WHERE provider=?').run(id);this.dre.audit('integration-disconnect',id,{account:old.account||null},{revoked,revocationSkipped,historyPreserved:true});});return {revoked,revocationSkipped,historyPreserved:true};});}
  runs(id){return this.repo.db.prepare('SELECT data FROM integration_sync_runs WHERE provider=? ORDER BY started_at DESC LIMIT 30').all(providerId(id)).map(read);}
  writeRun(run){this.repo.db.prepare('INSERT INTO integration_sync_runs VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET finished_at=excluded.finished_at,status=excluded.status,data=excluded.data').run(run.id,run.provider,run.startedAt,run.finishedAt||null,run.periodFrom,run.periodTo,run.status,JSON.stringify(run));}

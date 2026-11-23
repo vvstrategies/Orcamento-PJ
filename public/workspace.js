@@ -513,6 +513,7 @@
     window.addEventListener('eco:data-changed',()=>refresh().catch(error=>notify(error.message)));
     window.addEventListener('eco:quotes-changed',()=>refresh().catch(error=>notify(error.message)));
     await refresh();hydrateIcons();fromHash();document.body.dataset.workspaceReady='true';window.UniversalFinance?.initSettings();window.UniversalDre?.initSettings();window.UniversalProfit?.initSettings();window.UniversalIntegrations?.init();window.EcoSettings?.init();
+    if(params.get('settings')==='integrations')window.EcoSettings?.reveal('#integrations-center');
   }
   // demo(): clientes fictícios para testes e prévias (o botão "Ver demonstração" saiu da tela).
   window.EcoWorkspace={navigate,refresh,openDetail,icon,money,confirm:confirmAction,demo:enterDemo};

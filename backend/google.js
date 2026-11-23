@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { fail, hash } from './database.js';
+import { fail } from './database.js';
+import {OAuthStateStore} from './oauth-state-store.js';
 import { GOOGLE_SCOPES, classifyTokenFailure, mergeRefreshedTokens, grantedScopes } from './google-oauth.js';
 
 const authURL='https://accounts.google.com/o/oauth2/v2/auth',tokenURL='https://oauth2.googleapis.com/token',peopleURL='https://people.googleapis.com/v1/';
@@ -27,7 +28,10 @@ function normalizePerson(p){
 // - Cada recurso declara os escopos de que precisa; Contatos é pedido de forma incremental, sem derrubar Calendar/Drive.
 export class GoogleIntegration{
   constructor(repo,vault,config={},fetcher=globalThis.fetch){
+    // Calendar/Drive/Contacts always return to their own callback, never the Ads handler.
+    config={...config,...(config.appOrigin?{redirectURI:new URL('/api/google/callback',config.appOrigin).href}:{})};
     this.repo=repo;this.vault=vault;this.config=config;this.fetch=fetcher;this.refreshing=null;this.contactsWarmAt=0;
+    this.oauth=new OAuthStateStore(repo,vault,{diagnostics:config.oauthDiagnostics});
     this.calendarScopes=[config.calendarScope||GOOGLE_SCOPES.calendar,GOOGLE_SCOPES.drive];
     this.scopes=['openid','email',...this.calendarScopes];
     // Migração não destrutiva: guarda para que fluxo o consentimento foi iniciado.
@@ -58,22 +62,20 @@ export class GoogleIntegration{
   // purpose 'contacts': autorização incremental só do escopo de leitura de contatos.
   connect(session,{purpose='calendar'}={}){
     if(!this.configured())throw fail(503,'Configure GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET no servidor. Consulte o guia de conexão em Configurações.');
-    purpose=purpose==='contacts'?'contacts':'calendar';
+    purpose=['contacts','drive'].includes(purpose)?purpose:'calendar';
     const c=this.connection(),healthy=!!c&&!c.needsReconnect;
     const scopes=purpose==='contacts'?(healthy?['openid','email',GOOGLE_SCOPES.contacts]:[...this.scopes,GOOGLE_SCOPES.contacts]):this.scopes;
-    const state=crypto.randomBytes(32).toString('base64url'),verifier=crypto.randomBytes(48).toString('base64url');
-    this.repo.db.prepare('DELETE FROM oauth_states WHERE expires<?').run(Date.now());
-    this.repo.db.prepare('INSERT INTO oauth_states (state,session_id,verifier,expires,purpose) VALUES (?,?,?,?,?)').run(hash(state),session.id,verifier,Date.now()+600000,purpose);
+    const {state,verifier}=this.oauth.create({integration:'google-'+purpose,session,redirectURI:this.config.redirectURI,clientId:this.config.clientId});
     // prompt=consent só neste clique explícito de conectar/autorizar: é o que garante o refresh token (access_type=offline).
     // include_granted_scopes mantém Calendar/Drive ao adicionar Contatos (e vice-versa).
     const params={client_id:this.config.clientId,redirect_uri:this.config.redirectURI,response_type:'code',scope:scopes.join(' '),access_type:'offline',include_granted_scopes:'true',prompt:'consent',state,code_challenge:crypto.createHash('sha256').update(verifier).digest('base64url'),code_challenge_method:'S256',...(healthy&&c.email?{login_hint:c.email}:{})};
     const url=new URL(authURL);for(const [key,value] of Object.entries(params))url.searchParams.set(key,value);
     return {url:url.href,purpose};
   }
-  async callback(query,session){
-    const state=typeof query.state==='string'?query.state:'';
-    const saved=this.repo.transaction(()=>{const record=this.repo.db.prepare('SELECT * FROM oauth_states WHERE state=?').get(hash(state));if(!record||record.session_id!==session.id||record.expires<Date.now())throw fail(403,'Confirmação Google expirada ou inválida. Inicie a conexão novamente.');this.repo.db.prepare('DELETE FROM oauth_states WHERE state=?').run(hash(state));return record});
-    const purpose=saved.purpose==='contacts'?'contacts':'calendar';
+  async callback(query,session,callbackURI){
+    const saved=this.oauth.claim({state:query.state,session,allowed:['google-calendar','google-drive','google-contacts'],redirectURI:this.config.redirectURI,clientId:this.config.clientId,callbackURI});
+    const purpose=saved.integration.slice('google-'.length);
+    try{
     if(query.error)throw Object.assign(fail(400,'A conexão Google não foi autorizada.'),{purpose});
     if(typeof query.code!=='string'||query.code.length>4000)throw Object.assign(fail(400,'Código de autorização inválido.'),{purpose});
     const tokens=await this.token({code:query.code,code_verifier:saved.verifier,redirect_uri:this.config.redirectURI,grant_type:'authorization_code'});
@@ -91,8 +93,9 @@ export class GoogleIntegration{
     // Com include_granted_scopes o token cobre tudo que já foi concedido; mesmo assim, preserva os escopos anteriores da mesma conta.
     const allScopes=[...new Set([...(same&&!previous.needsReconnect?this.grants(previous):[]),...scopes])];
     const at=nowISO();
-    this.saveConnection({connectedAt:same?(previous.connectedAt||at):at,id:same?previous.id:crypto.randomUUID(),sub:user.sub,email:user.email,calendarId:same?previous.calendarId:this.config.calendarId||'primary',folderId:same?previous.folderId:this.repo.config('googleFolder:'+user.sub),accessToken:tokens.access_token,refreshToken:refresh,expires:Date.now()+Number(tokens.expires_in||3600)*1000,scopes:allScopes,needsReconnect:false,lastSuccessfulAt:at,tokenRefreshAt:at,lastFailureAt:same?previous.lastFailureAt||null:null,lastErrorCode:null});
+    this.oauth.complete(saved,()=>this.saveConnection({connectedAt:same?(previous.connectedAt||at):at,id:same?previous.id:crypto.randomUUID(),sub:user.sub,email:user.email,calendarId:same?previous.calendarId:this.config.calendarId||'primary',folderId:same?previous.folderId:this.repo.config('googleFolder:'+user.sub),accessToken:tokens.access_token,refreshToken:refresh,expires:Date.now()+Number(tokens.expires_in||3600)*1000,scopes:allScopes,needsReconnect:false,lastSuccessfulAt:at,tokenRefreshAt:at,lastFailureAt:same?previous.lastFailureAt||null:null,lastErrorCode:null}));
     return {...this.status(),purpose};
+    }catch(error){this.oauth.fail(saved);throw Object.assign(error,{purpose})}
   }
   async token(fields){
     let response,body;
@@ -152,6 +155,7 @@ export class GoogleIntegration{
     return {contacts:(r?.connections||[]).map(normalizePerson).filter(c=>c.name||c.phones.length||c.emails.length),nextPageToken:r?.nextPageToken||null,total:Number.isFinite(r?.totalPeople)?r.totalPeople:null};
   }
   async disconnect(){
+    this.oauth.cancel(['google-calendar','google-drive','google-contacts']);
     const c=this.connection();if(!c)return {ok:true};
     if(this.canRevoke&&!this.canRevoke()){this.repo.setConfig('google',null);return {ok:true,revoked:false,revocationSkipped:true};}
     let revoked=true;try{const r=await this.fetch('https://oauth2.googleapis.com/revoke',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({token:c.refreshToken}),signal:AbortSignal.timeout(15000)});revoked=r.ok}catch{revoked=false}

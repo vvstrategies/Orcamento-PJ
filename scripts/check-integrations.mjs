@@ -96,7 +96,7 @@ try{
  const before=JSON.stringify(repo.config('settings'));migrateIntegrations(repo);migrateIntegrations(repo);assert.equal(JSON.stringify(repo.config('settings')),before);
  const pending=await data(api('google-ads','connect'),{}),state=new URL(pending.url).searchParams.get('state');
  await assert.rejects(s.callback('google-ads',{state,code:'x'},{id:'other-session'}),e=>e.status===403);
- repo.db.prepare('UPDATE integration_oauth_states SET expires=0').run();
+ repo.db.prepare('UPDATE oauth_authorizations SET expires=0').run();
  assert.equal((await request(api('google-ads','callback')+'?state='+state+'&code=x')).status,403);
  await authorize('google-ads');await authorize('meta-ads');assert.equal((await data(api('google-ads','test'),{})).ok,true);
  const cipher=repo.db.prepare('SELECT secret FROM integration_connections WHERE provider=?').get('google-ads').secret;
