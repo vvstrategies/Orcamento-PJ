@@ -14,7 +14,7 @@
     "integrations:sync": "node scripts/sync-integrations.mjs",
     "test:purge": "node scripts/check-purge-cancelled.mjs",
     "test:auto-finance": "node scripts/check-auto-finance.mjs",
-    "test:pj": "node scripts/check-pj-installation.mjs && node scripts/check-corporate-fields.mjs",
+    "test:pj": "node scripts/check-pj-installation.mjs && node scripts/check-corporate-fields.mjs && node scripts/check-mattress-types.mjs",
     "local": "node scripts/start-local.cjs --no-open"
   },
   "dependencies": {
